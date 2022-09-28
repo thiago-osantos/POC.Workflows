@@ -73,14 +73,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:    
+    
     - name: Check out
       uses: actions/checkout@v3
       with:
         fetch-depth: 0
+    
     - name: Setup .NET
       uses: actions/setup-dotnet@v2
       with:
         dotnet-version: ${{ inputs.dotnet-version }}
+    
     # Ensure that nuget package source exists before restore
     - name: Ensure Package Source
       run: |
@@ -89,24 +92,30 @@ jobs:
           -u ${{ secrets.package-owner-name }} \
           -p ${{ secrets.package-access-token }} \
           --store-password-in-clear-text
+    
     - name: Restore dependencies
       run: dotnet restore ${{ inputs.solution }} 
+    
     # Builds the application.
     # Deployment Gate: Build
     # Gate Validation: Gate Validation Succeeds if build succeeds. A failed build will fail the Gate Validation.
     - name: Build
       run: dotnet build ${{ inputs.solution }} --no-restore /property:Configuration=Release
+    
     # Runs Unit Tests.
     # Deployment Gate: Unit Tests
     # Gate Validation: Gate Validation Succeeds apon all tests execution succeeded. If execution has failed tests the Gate Validation will fail.
     - name: Test      
       run: dotnet test ${{ inputs.solution }} --verbosity normal --no-restore /p:CollectCoverage=true /p:CoverletOutputFormat=opencover 
+    
     - name: Remove Package Source
       if: always()
       continue-on-error: true
       run: dotnet nuget remove source github
+    
     - name: Update path in the coverage report as SonarQube Scan run inside container      
       run: sed -i 's#${{ github.workspace }}#/github/workspace#g' **/coverage.opencover.xml
+    
     # Runs Sonar Qube and update results to SQ server.
     - name: SonarQube Scan      
       uses: sonarsource/sonarqube-scan-action@master
@@ -124,6 +133,7 @@ jobs:
           -Dsonar.test.exclusions=${{ inputs.path-to-test-project }}/**
           -Dsonar.tests=${{ inputs.path-to-test-project }}/
           -Dsonar.verbose=true
+    
     # Runs Sonar Qube Quality Gate check.
     # Deployment Gate: Code Quality Check
     # Gate Validation: Gate Validation Succeeds if code quality check succeeds. If the check fails the Gate Validation will fail.
@@ -133,6 +143,7 @@ jobs:
       timeout-minutes: 5
       env:
         SONAR_TOKEN: ${{ secrets.sonarqube-token }}
+    
     # Runs Dependency scanning
     # Deployment Gate: Dependency Scanning.
     # Gate Validation: Gate Validation succeeds if no dependency security issue is found based on 'severity threshold' and 'fail on' configuration.
@@ -143,6 +154,7 @@ jobs:
         SNYK_TOKEN: ${{ secrets.snyk-token }}
       with:
          args: --file=${{ inputs.solution }} --fail-on=${{ inputs.snyk-fail-on }} --severity-threshold=${{ inputs.snyk-severity-threshold }}
+    
     # Runs Synopsys Polaris Static Analysis
     # Deployment Gate: Polaris Static Analysis
     # Gate Validation: Gate Validaiont succeds if no issue is found. If issues are found Gate Validation will fail.
@@ -153,6 +165,7 @@ jobs:
           wget -q ${{ secrets.polaris-server-url }}/api/tools/polaris_cli-linux64.zip
           unzip -j -o polaris_cli-linux64.zip -d ${{ github.workspace }}/tmp
           ${{ github.workspace }}/tmp/polaris analyze -w
+    
     # Builds image.
     - name: Build ${{ inputs.app-name }} Image
       id: image-build
@@ -175,6 +188,7 @@ jobs:
           -t ${{ env.REGISTRY_URL }}/${{ env.APP_NAME }}:0.0.0-BUILD .          
           echo "::set-output name=dockerfilePath::Dockerfile"
         fi    
+    
     # Scans Image with docker file not located at solution folder for securiy issues.
     # Deployment Gate: Image Security Scanning
     # Gate Validation: Gate Validaton succeeds if no security issue is found based on 'severity threshold' and 'fail on' configuration. If securiyt
