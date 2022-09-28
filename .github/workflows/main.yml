@@ -1,0 +1,189 @@
+# Validates the PR content against the Build pipeline before it can be approved and merged.
+name: "DotNet PR validation build"
+
+on:
+  workflow_call:
+    inputs:      
+      dotnet-version:
+        description: "DotNet version used during build"
+        default: 6.0.x
+        required: false
+        type: string      
+      package-url:
+        description: "Url for Package restore"
+        required: true
+        type: string           
+      path-to-dockerfile:
+        description: "Path to dockerfile"
+        default: ''
+        required: false
+        type: string        
+      snyk-severity-threshold:        
+        default: medium
+        description: "Snyk Severity Threshold"
+        required: false
+        type: string
+      snyk-fail-on:        
+        default: all
+        description: "Snyk fail on configuration"
+        required: false
+        type: string        
+      solution:
+        description: "Solution to build"
+        required: true
+        type: string
+      sonarqube-url:
+        description: "Url to SonarQube"
+        required: true
+        type: string
+      path-to-test-project:
+        description: "Path to project containing tests"
+        required: true
+        type: string      
+    secrets:     
+      package-access-token:
+        description: "Access token to package storage"
+        required: true        
+      package-owner-name:
+        description: "Username used to access package storage"
+        required: true            
+      polaris-access-token:
+        description: "Access token for Polaris (Synpsys)"
+        required: true
+      polaris-server-url:
+        description: "URL for Polaris (Synpsys) server"
+        required: true
+      snyk-token:
+        description: "Access token for Snyk"
+        required: true
+      sonarqube-token:
+        description: "Access token for SonarQube"
+        required: true
+      sonarqube-github-token:
+        description: "Access token SonarQube to call GitHub"
+        required: true
+
+env:
+  APP_NAME: dotnetappimage
+  REGISTRY_URL: testcontainer
+
+jobs:
+  build:
+    name: Validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:    
+    - name: Check out
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v2
+      with:
+        dotnet-version: ${{ inputs.dotnet-version }}
+    # Ensure that nuget package source exists before restore
+    - name: Ensure Package Source
+      run: |
+        dotnet nuget add source ${{ inputs.package-url }} \
+          -n github \
+          -u ${{ secrets.package-owner-name }} \
+          -p ${{ secrets.package-access-token }} \
+          --store-password-in-clear-text
+    - name: Restore dependencies
+      run: dotnet restore ${{ inputs.solution }} 
+    # Builds the application.
+    # Deployment Gate: Build
+    # Gate Validation: Gate Validation Succeeds if build succeeds. A failed build will fail the Gate Validation.
+    - name: Build
+      run: dotnet build ${{ inputs.solution }} --no-restore /property:Configuration=Release
+    # Runs Unit Tests.
+    # Deployment Gate: Unit Tests
+    # Gate Validation: Gate Validation Succeeds apon all tests execution succeeded. If execution has failed tests the Gate Validation will fail.
+    - name: Test      
+      run: dotnet test ${{ inputs.solution }} --verbosity normal --no-restore /p:CollectCoverage=true /p:CoverletOutputFormat=opencover 
+    - name: Remove Package Source
+      if: always()
+      continue-on-error: true
+      run: dotnet nuget remove source github
+    - name: Update path in the coverage report as SonarQube Scan run inside container      
+      run: sed -i 's#${{ github.workspace }}#/github/workspace#g' **/coverage.opencover.xml
+    # Runs Sonar Qube and update results to SQ server.
+    - name: SonarQube Scan      
+      uses: sonarsource/sonarqube-scan-action@master
+      env:
+        GITHUB_TOKEN: ${{ secrets.sonarqube-github-token }}
+        SONAR_TOKEN: ${{ secrets.sonarqube-token }}
+        SONAR_HOST_URL: ${{ inputs.sonarqube-url }}
+      with:
+        projectBaseDir: ${{ github.workspace }}
+        args: >
+          -Dsonar.cs.opencover.reportsPaths=**/coverage.opencover.xml
+          -Dsonar.exclusions=**/*Test/**,**/obj/**,**/bin/**,**/Views/Shared/**,$(SolutionName).Test/**,docker-compose/**,**/gulpfile.js,**/docker-compose-tmpl.yml,validation/**
+          -Dsonar.projectKey=cd-poc
+          -Dsonar.projectVersion='0.0.0'
+          -Dsonar.test.exclusions=${{ inputs.path-to-test-project }}/**
+          -Dsonar.tests=${{ inputs.path-to-test-project }}/
+          -Dsonar.verbose=true
+    # Runs Sonar Qube Quality Gate check.
+    # Deployment Gate: Code Quality Check
+    # Gate Validation: Gate Validation Succeeds if code quality check succeeds. If the check fails the Gate Validation will fail.
+    - name: SonarQube Quality Gate Check
+      if: ${{ inputs.enable-unittest }}
+      uses: sonarsource/sonarqube-quality-gate-action@master
+      timeout-minutes: 5
+      env:
+        SONAR_TOKEN: ${{ secrets.sonarqube-token }}
+    # Runs Dependency scanning
+    # Deployment Gate: Dependency Scanning.
+    # Gate Validation: Gate Validation succeeds if no dependency security issue is found based on 'severity threshold' and 'fail on' configuration.
+    # If security issues are found the Gate Validation will fail.
+    - name: Run Snyk to check the project for vulnerabilities
+      uses: snyk/actions/dotnet@master
+      env:
+        SNYK_TOKEN: ${{ secrets.snyk-token }}
+      with:
+         args: --file=${{ inputs.solution }} --fail-on=${{ inputs.snyk-fail-on }} --severity-threshold=${{ inputs.snyk-severity-threshold }}
+    # Runs Synopsys Polaris Static Analysis
+    # Deployment Gate: Polaris Static Analysis
+    # Gate Validation: Gate Validaiont succeds if no issue is found. If issues are found Gate Validation will fail.
+    - name: Polaris Static Analysis
+      run: |
+          export POLARIS_SERVER_URL=${{ secrets.polaris-server-url }}
+          export POLARIS_ACCESS_TOKEN=${{ secrets.polaris-access-token }}
+          wget -q ${{ secrets.polaris-server-url }}/api/tools/polaris_cli-linux64.zip
+          unzip -j -o polaris_cli-linux64.zip -d ${{ github.workspace }}/tmp
+          ${{ github.workspace }}/tmp/polaris analyze -w
+    # Builds image.
+    - name: Build ${{ inputs.app-name }} Image
+      id: image-build
+      run: |      
+        if [ ${{ inputs.path-to-dockerfile != '' }} = true ]; then        
+          echo "Building image for docker file at '${{ inputs.path-to-dockerfile }}'"          
+          docker build \
+          --build-arg GITHUB_PACKAGE_URL=${{ inputs.package-url }} \
+          --build-arg GITHUB_PACKAGE_OWNER=${{ secrets.package-owner-name }} \
+          --build-arg GITHUB_PACKAGE_PASSWORD=${{ secrets.package-access-token }} \          
+          -f ${{ inputs.path-to-dockerfile }}/Dockerfile \
+          -t ${{ inputs.registry-url }}/${{ inputs.app-name }}:0.0.0-BUILD .          
+          echo "::set-output name=dockerfilePath::${{ inputs.path-to-dockerfile }}/Dockerfile"
+        else        
+          echo "Building image for docker file at project folder"          
+          docker build \  
+          --build-arg GITHUB_PACKAGE_URL=${{ env.package-url }} \
+          --build-arg GITHUB_PACKAGE_OWNER=${{ secrets.package-owner-name }} \
+          --build-arg GITHUB_PACKAGE_PASSWORD=${{ secrets.package-access-token }} \
+          -t ${{ env.REGISTRY_URL }}/${{ env.APP_NAME }}:0.0.0-BUILD .          
+          echo "::set-output name=dockerfilePath::Dockerfile"
+        fi    
+    # Scans Image with docker file not located at solution folder for securiy issues.
+    # Deployment Gate: Image Security Scanning
+    # Gate Validation: Gate Validaton succeeds if no security issue is found based on 'severity threshold' and 'fail on' configuration. If securiyt
+    # issues are found the Gate Validation will fail.
+    - name: Run Snyk test to check Docker image for vulnerabilities for dockerfile at ${{ inputs.path-to-dockerfile }}      
+      uses: snyk/actions/docker@master
+      env:
+        SNYK_TOKEN: ${{ secrets.snyk-token }}
+      with:
+        image: ${{ env.REGISTRY_URL }}/${{ env.APP_NAME }}:0.0.0-BUILD
+        args: --file=${{ steps.image-build.outputs.dockerfilePath }} --fail-on=${{ inputs.snyk-fail-on }} --severity-threshold=${{ inputs.snyk-severity-threshold }}
+        command: test
