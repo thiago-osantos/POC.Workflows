@@ -1,0 +1,367 @@
+name: "Build DotNet Applications"
+
+on:
+  workflow_call:
+    outputs:
+      buildVersion:
+        description: "Build version number"        
+        value: ${{ jobs.build.outputs.buildVersion }}
+      buildEnvironment:
+        description: "The Environment to which the build was created"
+        value: ${{ jobs.build.outputs.envName }}
+    inputs:
+      app-name:
+        description: "Name of the application used when publishing image"
+        required: true
+        type: string      
+      develop-branch-name:
+        default: 'develop'
+        description: "Name of the develop branch"
+        required: false
+        type: string
+      develop-environment-name:
+        default: 'Development'
+        description: "Name of the develop environment"
+        required: false
+        type: string      
+      dotnet-version:
+        default: 6.0.x
+        description: "DotNet version used during build"
+        required: false
+        type: string
+      git-version-spec:
+        default: '5.x'
+        description: "Versios Spec for GitVersion"
+        required: false
+        type: string
+      hotfix-branch-name:
+        default: 'hotfix'
+        description: "Name of the hotfix branch"
+        required: false
+        type: string
+      hotfix-environment-name:
+        default: 'Hotfix'
+        description: "Name of the hotfix environment"
+        required: false
+        type: string
+      main-branch-name:
+        default: 'main'
+        description: "Name of the main branch"
+        required: false
+        type: string
+      main-environment-name:
+        default: 'Production'
+        description: "Name of the main environment"
+        required: false
+        type: string        
+      package-url:
+        description: "Url for Package restore"
+        required: true
+        type: string
+      path-to-dockerfile:
+        default: ''
+        description: "Path to dockerfile"
+        required: false
+        type: string        
+      path-to-test-project:
+        description: "Path to project containing tests"
+        required: true
+        type: string
+      registry-url:
+        description: "Url to container registry"
+        required: true
+        type: string
+      release-branch-name:
+        default: 'release'
+        description: "Name of the release branch"
+        required: false
+        type: string
+      release-environment-name:
+        default: 'Release'
+        description: "Name of the release environment"
+        required: false
+        type: string
+      snyk-severity-threshold:        
+        default: medium
+        description: "Snyk Severity Threshold"
+        required: false
+        type: string
+      snyk-fail-on:        
+        default: all
+        description: "Snyk fail on configuration"
+        required: false
+        type: string           
+      solution:
+        description: "Solution to build"
+        required: true
+        type: string
+      sonarqube-url:
+        description: "Url to SonarQube"
+        required: true        
+        type: string
+    secrets:
+      azure-credentials:
+        description: "Credentials used to login into Azure"
+        required: true
+      keyvault-name:
+        description: "Name of Azure Key Vault"
+        required: false
+      polaris-access-token:
+        description: "Access token for Polaris (Synpsys)"
+        required: true
+      polaris-server-url:
+        description: "URL for Polaris (Synpsys) server"
+        required: true
+      registry-username:
+        description: "Service Principal Id used to login into the Containter Registry"
+        required: true
+      registry-password:
+        description: "Service Principal Password used to login into the Containter Registry"
+        required: true
+      snyk-token:
+        description: "Access Token used to access Snyk"
+        required: true
+      sonarqube-token:
+        description: "Access token for SonarQube"
+        required: true
+      sonarqube-github-token:
+        description: "Access token SonarQube to call GitHub"
+        required: true
+
+jobs:
+  build:
+    name: Continuous Integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      buildVersion: ${{ steps.buildVersion.outputs.imageBuildVersion }}
+      envName: ${{ steps.environmentCheck.outputs.envName }}    
+    steps:    
+    
+    # Checks out application code
+    - name: Check out
+      uses: actions/checkout@v2
+      with:
+        fetch-depth: 0
+    
+    # Sets up .NET version
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v1
+      with:
+        dotnet-version: ${{ inputs.dotnet-version }}
+
+    # Defines the build environment
+    - name: Define Build Environment
+      id: environmentCheck
+      run: |
+        echo "Running on branch ${{ github.ref }}"
+        echo "Develop branch name set to '${{ inputs.develop-branch-name }}'"
+        echo "Hotfix branch name set to '${{ inputs.hotfix-branch-name }}'"
+        echo "Release branch name set to '${{ inputs.release-branch-name }}'"
+        echo "Main branch name set to '${{ inputs.main-branch-name }}'"
+        if [ ${{ contains(github.ref, inputs.main-branch-name) }} = true ]; then
+          echo "::set-output name=envName::${{ inputs.main-environment-name }}"
+        elif [ ${{ contains(github.ref, inputs.hotfix-branch-name) }} = true ]; then
+          echo "::set-output name=envName::${{ inputs.hotfix-environment-name }}"
+        elif [ ${{ contains(github.ref, inputs.release-branch-name) }} = true ]; then
+          echo "::set-output name=envName::${{ inputs.release-environment-name }}"
+        elif [ ${{ contains(github.ref, inputs.develop-branch-name) }} = true ]; then
+          echo "::set-output name=envName::${{ inputs.develop-environment-name }}"
+        else
+           echo "::set-output name=envName::Feature"
+        fi          
+          
+    - name: Print Environment
+      run: echo "Building for ${{ steps.environmentCheck.outputs.envName }} environment"
+    
+    # Calculate current version
+    - name: Install GitVersion      
+      uses: gittools/actions/gitversion/setup@v0.9.11
+      with:
+        versionSpec: ${{ inputs.git-version-spec }}
+
+    - name: Calculate Build Version
+      id: gitversion
+      uses: gittools/actions/gitversion/execute@v0.9.11
+    
+    # Set Build versions ford DLL and Images
+    - name: Set Build Version
+      id: buildVersion
+      run: |
+        if [ ${{ !contains(github.ref, inputs.main-branch-name) }} = true ]; then
+          echo "Creating build version for Non PROD Environment"
+          echo "::set-output name=imageBuildVersion::${{ steps.gitversion.outputs.MajorMinorPatch }}.${{ steps.gitversion.outputs.EscapedBranchName }}.${{ steps.gitversion.outputs.CommitsSinceVersionSource }}"
+          echo "::set-output name=dllBuildVersion::${{ steps.gitversion.outputs.MajorMinorPatch }}.${{ steps.gitversion.outputs.CommitsSinceVersionSource }}"
+        else
+           echo "Creating Build version for PROD Environment"
+           echo "::set-output name=imageBuildVersion::${{ steps.gitversion.outputs.MajorMinorPatch }}"
+           echo "::set-output name=dllBuildVersion::${{ steps.gitversion.outputs.MajorMinorPatch }}"
+        fi
+    
+    - name: Print Version
+      run: |
+        echo "Image Version - ${{ steps.buildVersion.outputs.imageBuildVersion }}"
+        echo "DLL Version - ${{ steps.buildVersion.outputs.dllBuildVersion }}"
+    
+    # Ensure that nuget package source exists before restore
+    - name: Ensure Package Source
+      run: |
+        dotnet nuget add source ${{ inputs.package-url }} \
+          -n github \
+          -u ${{ secrets.package-owner-name }} \
+          -p ${{ secrets.package-access-token }} \
+          --store-password-in-clear-text
+    
+    - name: Restore dependencies
+      run: dotnet restore ${{ inputs.solution }}
+    
+    # Builds the application.
+    # Deployment Gate: Build
+    # Gate Validation: Gate Validation Succeeds if build succeeds. A failed build will fail the Gate Validation.
+    - name: Build
+      run: dotnet build ${{ inputs.solution }} --no-restore /property:Configuration=Release /property:Version=${{ steps.buildVersion.outputs.dllBuildVersion }}
+
+    # Runs Unit Tests.
+    # Deployment Gate: Unit Tests
+    # Gate Validation: Gate Validation Succeeds apon all tests execution succeeded. If execution has failed tests the Gate Validation will fail.
+    - name: Test
+      run: dotnet test ${{ inputs.solution }} --verbosity normal /property:CollectionCoverage=true /property:CoverletOutputFormat=opencover
+
+    - name: Remove Package Source
+      if: always()
+      continue-on-error: true
+      run: dotnet nuget remove source github
+
+    # Configure path to Sonar Qube.
+    - name: Update path in the coverage report as SonarQube Scan run inside container
+      run: sed -i 's#${{ github.workspace }}#/github/workspace#g' **/coverage.opencover.xml
+
+    # Runs Sonar Qube and update results to SQ server.
+    - name: SonarQube Scan      
+      uses: sonarsource/sonarqube-scan-action@master
+      env:
+        GITHUB_TOKEN: ${{ secrets.sonarqube-github-token }}
+        SONAR_TOKEN: ${{ secrets.sonarqube-token }}
+        SONAR_HOST_URL: ${{ inputs.sonarqube-url }}
+      with:
+        projectBaseDir: ${{ github.workspace }}
+        args: >
+          -Dsonar.cs.opencover.reportsPaths=**/coverage.opencover.xml
+          -Dsonar.exclusions=**/*Test/**,**/obj/**,**/bin/**,**/Views/Shared/**,$(SolutionName).Test/**,docker-compose/**,**/gulpfile.js,**/docker-compose-tmpl.yml,validation/**
+          -Dsonar.projectKey=cd-poc
+          -Dsonar.projectVersion='${{ steps.buildVersion.outputs.imageBuildVersion }}'
+          -Dsonar.test.exclusions=${{ inputs.path-to-test-project }}/**
+          -Dsonar.tests=${{ inputs.path-to-test-project }}/
+          -Dsonar.verbose=true
+    
+    # Runs Sonar Qube Quality Gate check.
+    # Deployment Gate: Code Quality Check
+    # Gate Validation: Gate Validation Succeeds if code quality check succeeds. If the check fails the Gate Validation will fail.
+    - name: SonarQube Quality Gate Check
+      if: ${{ inputs.enable-unittest }}
+      uses: sonarsource/sonarqube-quality-gate-action@master
+      timeout-minutes: 5
+      env:
+        SONAR_TOKEN: ${{ secrets.sonarqube-token }}
+
+    # Runs Dependency scanning and updates Snyk dashboard. 
+    - name: Run Snyk monitor to scan the project for vulnerabilities
+      uses: snyk/actions/dotnet@master
+      env:
+        SNYK_TOKEN: ${{ secrets.snyk-token }}
+      with:
+        args: --file=${{ inputs.solution }} --fail-on=${{ inputs.snyk-fail-on }} --severity-threshold=${{ inputs.snyk-severity-threshold }}
+        command: monitor
+
+    # Runs Dependency scanning
+    # Deployment Gate: Dependency Scanning.
+    # Gate Validation: Gate Validation succeeds if no dependency security issue is found based on 'severity threshold' and 'fail on' configuration.
+    # If security issues are found the Gate Validation will fail.
+    - name: Run Snyk test to check the project for vulnerabilities
+      uses: snyk/actions/dotnet@master
+      env:
+        SNYK_TOKEN: ${{ secrets.snyk-token }}
+      with:
+        args: --file=${{ inputs.solution }} --fail-on=${{ inputs.snyk-fail-on }} --severity-threshold=${{ inputs.snyk-severity-threshold }}
+        command: test
+    
+#    # Runs Synopsys Polaris Static Analysis
+#    # Deployment Gate: Polaris Static Analysis
+#    # Gate Validation: Gate Validaiont succeds if no issue is found. If issues are found Gate Validation will fail.
+#    - name: Polaris Static Analysis
+#      run: |
+#          export POLARIS_SERVER_URL=${{ secrets.polaris-server-url }}
+#          export POLARIS_ACCESS_TOKEN=${{ secrets.polaris-access-token }}
+#          wget -q ${{ secrets.polaris-server-url }}/api/tools/polaris_cli-linux64.zip
+#          unzip -j -o polaris_cli-linux64.zip -d ${{ github.workspace }}/tmp
+#          ${{ github.workspace }}/tmp/polaris analyze -w
+
+    - name: Create image identity
+      id: imageIdentity
+      run: |
+        echo "::set-output name=imageName::${{ inputs.registry-url }}/${{ inputs.app-name }}:${{ steps.buildVersion.outputs.imageBuildVersion }}"
+    
+    # Builds image.
+    - name: Build ${{ inputs.app-name }} Image
+      id: image-build
+      run: |      
+        if [ ${{ inputs.path-to-dockerfile != '' }} = true ]; then        
+          echo "Building image for docker file at '${{ inputs.path-to-dockerfile }}'"          
+          docker build \
+          --build-arg GITHUB_PACKAGE_URL=${{ inputs.package-url }} \
+          --build-arg GITHUB_PACKAGE_OWNER=${{ secrets.package-owner-name }} \
+          --build-arg GITHUB_PACKAGE_PASSWORD=${{ secrets.package-access-token }} \ 
+          --build-arg DLL_VERSION=${{ steps.buildVersion.outputs.dllBuildVersion }}
+          -f ${{ inputs.path-to-dockerfile }}/Dockerfile \
+          -t ${{ steps.imageIdentity.outputs.imageName }} .
+          echo "::set-output name=dockerfilePath::${{ inputs.path-to-dockerfile }}/Dockerfile"
+        else
+          echo "Building image for docker file at project folder"
+           docker build \
+          --build-arg GITHUB_PACKAGE_URL=${{ inputs.package-url }} \
+          --build-arg GITHUB_PACKAGE_OWNER=${{ secrets.package-owner-name }} \
+          --build-arg GITHUB_PACKAGE_PASSWORD=${{ secrets.package-access-token }} \ 
+          --build-arg DLL_VERSION=${{ steps.buildVersion.outputs.dllBuildVersion }}
+          -t ${{ steps.imageIdentity.outputs.imageName }} .          
+          echo "::set-output name=dockerfilePath::Dockerfile"
+        fi
+    
+    # Scans Image with docker file not located at solution folder for securiy issues and updates Snyk dashboard.   
+    - name: Run Snyk monitor to scan Docker image for vulnerabilities for dockerfile at ${{ inputs.path-to-dockerfile }}
+      uses: snyk/actions/docker@master
+      env:
+        SNYK_TOKEN: ${{ secrets.snyk-token }}
+      with:
+        image: ${{ steps.imageIdentity.outputs.imageName }} --fail-on=${{ inputs.snyk-fail-on }} --severity-threshold=${{ inputs.snyk-severity-threshold }}
+        args: --file=${{ steps.image-build.outputs.dockerfilePath }}
+        command: monitor         
+
+    # Scans Image with docker file not located at solution folder for securiy issues.
+    # Deployment Gate: Image Security Scanning
+    # Gate Validation: Gate Validaton succeeds if no security issue is found based on 'severity threshold' and 'fail on' configuration. If securiyt
+    # issues are found the Gate Validation will fail.
+    - name: Run Snyk test to check Docker image for vulnerabilities for dockerfile at ${{ inputs.path-to-dockerfile }}
+      uses: snyk/actions/docker@master
+      env:
+        SNYK_TOKEN: ${{ secrets.snyk-token }}
+      with:
+        image: ${{ steps.imageIdentity.outputs.imageName }}
+        args: --file=${{ steps.image-build.outputs.dockerfilePath }} --fail-on=${{ inputs.snyk-fail-on }} --severity-threshold=${{ inputs.snyk-severity-threshold }}
+        command: test    
+
+    # Logs in into Azure
+    - name: Login into Azure
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.azure-credentials }}
+
+    # Connects to ACR to Push image.
+    - name: Connect to ACR      
+      uses: Azure/docker-login@v1
+      with:
+        login-server: ${{ inputs.registry-url }}
+        username: ${{ secrets.registry-username }}
+        password: ${{ secrets.registry-password }}    
+    
+    - name: Push Image      
+      run: docker push ${{ steps.imageIdentity.outputs.imageName }}
