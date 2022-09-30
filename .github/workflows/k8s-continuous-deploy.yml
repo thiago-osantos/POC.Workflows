@@ -1,0 +1,122 @@
+name: "Deploy the Application into Kubernetes"
+
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        description: "Name of the application used when publishing image"
+        required: true
+        type: string      
+      build-version:
+        description: "Version of the build"
+        required: true        
+        type: string
+      cluster-name:
+        description: "The name of the K8s Cluster"
+        required: true
+        type: string
+      cluster-resource-group:
+        description: "The resource group name of the K8s Cluster."
+        required: true
+        type: string
+      environment:
+        description: "Environment used during deployment"
+        required: true
+        type: string      
+      helm-chart-name:
+        description: "Name of the helm chart used during deployment"
+        required: true
+        type: string
+      namespace:
+        description: "Namespace to deploy application"
+        required: true
+        type: string
+      snyk-severity-threshold:        
+        default: medium
+        description: "Snyk Severity Threshold"
+        required: false
+        type: string
+      snyk-fail-on:        
+        default: all
+        description: "Snyk fail on configuration"
+        required: false
+        type: string
+      registry-url:
+        description: "container registry url"
+        required: true
+        type: string
+    secrets:
+      azure-credentials:
+        description: "Credentials used to access Azure"
+        required: true
+      helm-repo-access-token:
+        description: "Access token used to access helm repo"
+        required: false
+      snyk-token:
+        description: "Access token used to access snyk"
+        required: true
+      
+
+jobs:
+  build:
+    name: Continuous Deployment
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: ${{ inputs.environment }}
+    steps:
+      # Logs in into Azure
+      - name: Login into Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.azure-credentials }}
+
+      # Gets AKS credentials for Kubectl and Helm
+      - name: Set AKS Context
+        run: az aks get-credentials --resource-group ${{ inputs.cluster-resource-group }} --name ${{ inputs.cluster-name }} --admin
+      
+      # Installs helpm
+      - name: Install Helm
+        uses: Azure/setup-helm@v2.0
+      
+      # Checks out deployment hepo
+      - name: Checkout Deployment repo
+        uses: actions/checkout@v3
+        with:
+          repository: ea-intitiatives/CD.POC.Deploy
+          token: ${{ secrets.helm-repo-access-token }}
+          path: './Deploy'     
+
+      # Creates deployment manifest from helm charts for IaC Scanning.
+      - name: Creates deployment manifest for ${{ inputs.app-name }} version ${{ inputs.build-version }} 
+        run: |         
+          helm template  ${{ inputs.app-name }} ${{ github.workspace }}/Deploy/k8s/helm/${{ inputs.helm-chart-name }}  \
+            --namespace ${{ inputs.namespace }} \
+            --set clustername=${{ inputs.cluster-name }} \
+            --set app.name=${{ inputs.app-name }} \
+            --set image.repository=${{ inputs.registry-url }}/${{ inputs.app-name }} \
+            --set image.pullPolicy=Always \
+            --output-dir helm_template_output
+      
+      # Runs IaC scanning
+      # Deployment Gate: IaC Scanning.
+      # Gate Validation: Gate Validation succeeds if no security issue is found based on 'severity threshold' and 'fail on' configuration.
+      # If security issues are found the Gate Validation will fail.
+      - name: Run Snyk to check the deployment manifests for security issues      
+        uses: snyk/actions/iac@master
+        env:
+          SNYK_TOKEN: ${{ secrets.snyk-token }}
+        with:
+          args: --report --severity-threshold=${{ inputs.snyk-severity-threshold }}
+          file: ./helm_template_output
+
+       # Deploy current release
+      - name: Deploy ${{ inputs.app-name }} version ${{ inputs.build-version }} 
+        run: |
+          helm upgrade ${{ inputs.app-name }} ${{ github.workspace }}/Deploy/k8s/helm/${{ inputs.helm-chart-name }} \
+            --namespace ${{ inputs.namespace }} \
+            --install \
+            --set clustername=${{ inputs.cluster-name }} \
+            --set app.name=${{ inputs.app-name }} \
+            --set image.repository=${{ inputs.registry-url }}/${{ inputs.app-name }} \
+            --set image.tag=${{ inputs.build-version }} \
+            --set image.pullPolicy=Always
